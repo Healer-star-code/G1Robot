@@ -1,0 +1,20 @@
+# G1 动作映射项目依赖
+# 安装: pip install -r requirements.txt
+
+# 核心
+numpy>=1.21
+opencv-python>=4.5
+
+# RealSense 深度相机
+pyrealsense2>=2.50
+
+# MediaPipe 人体姿态估计
+mediapipe>=0.10.0
+
+# 逆运动学（可选，用于手臂 IK）
+# 建议通过 conda 安装: conda install pinocchio -c conda-forge
+# pinocchio>=3.1.0
+
+# G1 通信（从 GitHub 安装）
+# git clone https://github.com/unitreerobotics/unitree_sdk2_python.git
+# cd unitree_sdk2_python && pip install -e .
