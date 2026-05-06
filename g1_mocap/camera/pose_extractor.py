@@ -1,34 +1,51 @@
 """
-RealSense + MediaPipe 人体 3D 关键点提取
+RealSense + YOLO Pose 人体 3D 关键点提取
 ========================================
-参考: MonkeySee_MonkeyDo 的 camera_tracker.py（OAK-D + MediaPipe）
-      Nao_Mimc 的 Pose_est.py（OpenCV + MediaPipe）
-适配: RealSense D435i/D405 深度相机 + MediaPipe Pose
+替代 MediaPipe，解决 Python 3.12 兼容性问题
+适配: RealSense D435i/D405 深度相机 + YOLOv8 Pose
 """
 
 import time
 import numpy as np
 import cv2
-import mediapipe as mp
+from ultralytics import YOLO
 import pyrealsense2 as rs
 
 
 class RealSensePoseExtractor:
     """
-    使用 Intel RealSense 深度相机 + MediaPipe Pose
-    提取 33 个人体关键点的 3D 坐标（单位: 米）
+    使用 Intel RealSense 深度相机 + YOLOv8 Pose
+    提取 17 个人体关键点的 3D 坐标（单位: 米）
 
-    MediaPipe Pose 关键点索引（部分）:
+    YOLO Pose 关键点索引 (与 MediaPipe 兼容映射):
          0: 鼻尖
-        11: 左肩    12: 右肩
-        13: 左肘    14: 右肘
-        15: 左腕    16: 右腕
-        23: 左髋    24: 右髋
-        25: 左膝    26: 右膝
-        27: 左踝    28: 右踝
-        29: 左脚跟  30: 右脚跟
-        31: 左脚尖  32: 右脚尖
+         5: 左肩    6: 右肩
+         7: 左肘    8: 右肘
+         9: 左腕    10: 右腕
+        11: 左髋    12: 右髋
+        13: 左膝    14: 右膝
+        15: 左踝    16: 右踝
+
+    注意: YOLO 只有 17 个关键点，少于 MediaPipe 的 33 个
+    关键点编号直接映射到 MediaPipe 的: 0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28
     """
+
+    # YOLO 索引 -> MediaPipe 索引 映射
+    YOLO_TO_MP = {
+        0: 0,    # 鼻尖
+        5: 11,   # 左肩
+        6: 12,   # 右肩
+        7: 13,   # 左肘
+        8: 14,   # 右肘
+        9: 15,   # 左腕
+        10: 16,  # 右腕
+        11: 23,  # 左髋
+        12: 24,  # 右髋
+        13: 25,  # 左膝
+        14: 26,  # 右膝
+        15: 27,  # 左踝
+        16: 28,  # 右踝
+    }
 
     def __init__(self,
                  width=640,
@@ -43,9 +60,9 @@ class RealSensePoseExtractor:
             width, height: 彩色图像分辨率
             fps: 目标帧率
             serial: RealSense 序列号，None 表示自动选择
-            complexity: MediaPipe 模型复杂度 (0/1/2)
+            complexity: 兼容参数（YOLO 自动忽略）
             detection_conf: 检测置信度阈值
-            tracking_conf: 跟踪置信度阈值
+            tracking_conf: 兼容参数（YOLO 自动忽略）
         """
         # ---- RealSense 初始化 ----
         self.pipeline = rs.pipeline()
@@ -74,21 +91,14 @@ class RealSensePoseExtractor:
         self.align = rs.align(rs.stream.color)
 
         # 关闭激光发射器（纯被动深度，适用于近距离人体）
-        # 如需远距离可注释掉这两行
         if depth_sensor.supports(rs.option.emitter_enabled):
             depth_sensor.set_option(rs.option.emitter_enabled, 0)
 
-        # ---- MediaPipe Pose 初始化 ----
-        self.mp_pose = mp.solutions.pose
-        self.mp_drawing = mp.solutions.drawing_utils
-
-        self.pose = self.mp_pose.Pose(
-            static_image_mode=False,
-            model_complexity=complexity,
-            smooth_landmarks=True,
-            min_detection_confidence=detection_conf,
-            min_tracking_confidence=tracking_conf
-        )
+        # ---- YOLO Pose 初始化 ----
+        print("[pose] Loading YOLOv8 pose model...")
+        self.model = YOLO("yolov8n-pose.pt")
+        self.detection_conf = detection_conf
+        print("[pose] YOLO model ready.")
 
         # 跳过几帧让相机自动曝光稳定
         for _ in range(30):
@@ -98,6 +108,11 @@ class RealSensePoseExtractor:
         self._last_time = time.time()
         self._fps_display = 0.0
         self._annotated_frame = None  # 缓存最近一帧的标注图像
+        self._connections = [
+            (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+            (11, 12), (5, 11), (6, 12),
+            (11, 13), (13, 15), (12, 14), (14, 16)
+        ]
 
     def _pixel_to_3d(self, px, py, depth_m):
         """像素坐标 → 相机坐标系 3D 坐标 (单位: 米)
@@ -115,6 +130,7 @@ class RealSensePoseExtractor:
     def get_landmarks_3d(self):
         """
         获取 33 个人体关键点的 3D 坐标，同时缓存标注帧供 get_annotated_frame() 使用
+        （返回数组大小为 33 以保持与 MediaPipe 版本的接口兼容，未使用的关键点设为 0）
 
         返回:
             success:  是否成功检测到人体
@@ -122,7 +138,7 @@ class RealSensePoseExtractor:
             timestamp:  时间戳
         """
         success = False
-        landmarks_3d = None
+        landmarks_3d = np.zeros((33, 3), dtype=np.float32)
         timestamp = time.time()
 
         try:
@@ -135,100 +151,69 @@ class RealSensePoseExtractor:
                 self._annotated_frame = None
                 return success, landmarks_3d, timestamp
 
-            # MediaPipe 推理
+            # YOLO 推理
             image = np.asanyarray(color_frame.get_data())
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            results = self.pose.process(image_rgb)
+            results = self.model(image, verbose=False, conf=self.detection_conf)
 
             # ---- 构建标注帧（缓存） ----
             annotated = image.copy()
-            if results.pose_landmarks:
-                self.mp_drawing.draw_landmarks(
-                    annotated, results.pose_landmarks,
-                    self.mp_pose.POSE_CONNECTIONS,
-                    self.mp_drawing.DrawingSpec(
-                        color=(0, 255, 0), thickness=2, circle_radius=2),
-                    self.mp_drawing.DrawingSpec(
-                        color=(0, 0, 255), thickness=2, circle_radius=2)
-                )
 
-                # 像素 → 3D 转换
-                landmarks_3d = np.zeros((33, 3), dtype=np.float32)
-                h, w = self.img_h, self.img_w
+            if len(results) > 0 and results[0].keypoints is not None:
+                kps = results[0].keypoints.data
+                if len(kps) > 0:
+                    kp = kps[0].cpu().numpy()  # shape: (17, 3) - x, y, confidence
 
-                for i, lm in enumerate(results.pose_landmarks.landmark):
-                    px = int(np.clip(lm.x * w, 0, w - 1))
-                    py = int(np.clip(lm.y * h, 0, h - 1))
-                    depth_mm = depth_frame.get_distance(px, py)
-                    depth_m = depth_mm  # pyrealsense2 get_distance 返回米
+                    # 绘制骨架连接线
+                    for i, j in self._connections:
+                        conf_i, conf_j = kp[i, 2], kp[j, 2]
+                        if conf_i > self.detection_conf and conf_j > self.detection_conf:
+                            pt1 = (int(kp[i, 0]), int(kp[i, 1]))
+                            pt2 = (int(kp[j, 0]), int(kp[j, 1]))
+                            cv2.line(annotated, pt1, pt2, (0, 255, 0), 2)
 
-                    landmarks_3d[i] = self._pixel_to_3d(px, py, depth_m)
+                    # 绘制关键点
+                    for i in range(17):
+                        conf = kp[i, 2]
+                        if conf > self.detection_conf:
+                            pt = (int(kp[i, 0]), int(kp[i, 1]))
+                            cv2.circle(annotated, pt, 3, (0, 128, 255), -1)
 
-                success = True
-                self._frame_count += 1
+                    # 获取深度图并计算 3D 坐标
+                    depth_np = np.asanyarray(depth_frame.get_data())
 
-            # FPS
-            now = time.time()
-            dt = now - self._last_time
-            if dt > 0.5:
-                self._fps_display = self._frame_count / dt
-                self._frame_count = 0
-                self._last_time = now
-            cv2.putText(annotated, f"FPS: {self._fps_display:.1f}",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7, (0, 255, 0), 2)
+                    for yolo_idx in range(17):
+                        conf = kp[yolo_idx, 2]
+                        if conf > self.detection_conf:
+                            px = int(round(kp[yolo_idx, 0]))
+                            py = int(round(kp[yolo_idx, 1]))
+
+                            # 边界检查
+                            px = max(0, min(px, self.img_w - 1))
+                            py = max(0, min(py, self.img_h - 1))
+
+                            # 中值滤波获取深度
+                            win = 2
+                            u0, v0 = max(0, px - win), max(0, py - win)
+                            u1, v1 = min(self.img_w, px + win + 1), min(self.img_h, py + win + 1)
+                            patch = depth_np[v0:v1, u0:u1].reshape(-1)
+                            patch = patch[patch > 0]
+                            if patch.size > 0:
+                                depth_m = float(np.median(patch) * self.depth_scale)
+                                if depth_m > 0.1 and depth_m < 5.0:
+                                    mp_idx = self.YOLO_TO_MP.get(yolo_idx, yolo_idx)
+                                    if mp_idx < 33:
+                                        landmarks_3d[mp_idx] = self._pixel_to_3d(px, py, depth_m)
+
+                    success = True
 
             self._annotated_frame = annotated
+            return success, landmarks_3d, timestamp
 
         except Exception as e:
-            print(f"[WARN] 帧处理异常: {e}")
+            print(f"[pose] Frame error: {e}")
             self._annotated_frame = None
-
-        return success, landmarks_3d, timestamp
+            return success, landmarks_3d, timestamp
 
     def get_annotated_frame(self):
-        """获取最近一帧带骨骼标注的彩色图像（与 get_landmarks_3d() 共用同一帧，无额外推理）"""
+        """返回最近一帧的标注图像"""
         return self._annotated_frame
-
-    def stop(self):
-        """释放资源"""
-        self.pose.close()
-        self.pipeline.stop()
-
-
-# ============================================================
-# 测试独立运行
-# ============================================================
-if __name__ == "__main__":
-    print("[TEST] 测试 RealSense + MediaPipe 姿态提取...")
-    extractor = RealSensePoseExtractor()
-
-    try:
-        while True:
-            success, landmarks, ts = extractor.get_landmarks_3d()
-
-            # 显示标注帧
-            frame = extractor.get_annotated_frame()
-            if frame is not None:
-                status = "DETECTED" if success else "NO PERSON"
-                color = (0, 255, 0) if success else (0, 0, 255)
-                cv2.putText(frame, status, (10, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1.0, color, 2)
-                cv2.imshow("G1 Motion Capture", frame)
-
-            # 打印关键点（调试）
-            if success:
-                print(f"\r 左腕: ({landmarks[15][0]:.2f}, {landmarks[15][1]:.2f}, {landmarks[15][2]:.2f})"
-                      f"  右腕: ({landmarks[16][0]:.2f}, {landmarks[16][1]:.2f}, {landmarks[16][2]:.2f})",
-                      end="")
-
-            if cv2.waitKey(1) & 0xFF == 27:
-                break
-
-    except KeyboardInterrupt:
-        pass
-    finally:
-        extractor.stop()
-        cv2.destroyAllWindows()
-        print("\n[TEST] 测试结束")

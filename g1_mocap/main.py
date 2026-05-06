@@ -17,6 +17,8 @@ Intel RealSense + MediaPipe Pose → G1 全身关节映射
 
 import sys
 import os
+os.environ['QT_QPA_PLATFORM'] = 'xcb'
+os.environ['XDG_SESSION_TYPE'] = 'x11'
 import time
 import math
 import argparse
